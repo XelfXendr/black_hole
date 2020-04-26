@@ -1,13 +1,15 @@
 use nalgebra::{Rotation3, Vector3, Unit};
-use image::{RgbImage, Rgb};
-use std::time::Instant;
-use std::cmp::{min, max};
+use image::{RgbImage, Pixel, Rgb};
+use std::time::{Instant};
+use std::cmp::{min};
 use num_cpus;
 use std::thread::{spawn, JoinHandle};
 use std::collections::VecDeque;
 use std::io::{stdin, stdout, Write};
 use std::str::FromStr;
 use std::f64::consts::PI;
+use lazy_static::lazy_static;
+use chrono::{Local};
 
 const C: f64 = 299792458.0;
 const M: f64 = 8.3e36;
@@ -21,7 +23,15 @@ const RS: f64 = 2f64 / 3f64 * G * M / C / C; //it's 3 time smaller than it shoul
 /*
 TODO:
     Use better colors (and textures?) for ring and skybox
+    user input textures
+    user input accretion disc size
 */
+
+lazy_static! {
+    //textures
+    static ref ACCRETION_IMG: RgbImage = image::open("accretion_disc.png").unwrap().to_rgb();
+    static ref R_ISCO_PX: u32 = 150u32;
+}
 
 fn main() {
     //Getting input
@@ -79,6 +89,7 @@ fn main() {
     let mut pixel_thread_queue: VecDeque<JoinHandle<(u32, u32, usize, Rgb<u8>)>> = VecDeque::new();
 
     //drawing pixels
+    let stopwatch = Instant::now();
     for j in 0..img_height
     {
         for i in 0..img_width
@@ -108,8 +119,10 @@ fn main() {
     {
         join_pixel_thread(h, &mut img);
     }
+    println!("Rendered in {:?}", stopwatch.elapsed());
 
-    img.save("image.png").unwrap();
+    let time = Local::now();
+    img.save(format!("output/black_hole_{}.png", time.format("%Y-%m-%d-%H-%M-%S"))).unwrap();
 }
 
 fn get_pixel(cam_pos: Vector3<f64>, vertical_angle: f64, horizontal_angle: f64, degrees_per_pixel: f64, samples: usize, threads_to_use: usize) -> Rgb<u8>
@@ -169,7 +182,7 @@ fn send_ray(mut pos_photon: Vector3<f64>, mut dir_photon: Vector3<f64>) -> Rgb<u
         }
         if dist > RS*20f64
         {
-            return Rgb([0,0,10]);
+            return Rgb([0,0,0]);
         }
 
         if dist < 2f64*RS
@@ -196,9 +209,17 @@ fn send_ray(mut pos_photon: Vector3<f64>, mut dir_photon: Vector3<f64>) -> Rgb<u
         }
         let new_pos = pos_photon + dir_photon * delta_time;
 
-        if ((new_pos.y < 0f64) ^ (pos_photon.y < 0f64)) && dist > 3f64*RS && dist < 6f64*RS
+        let posvec = new_pos - pos_photon;
+        let t = -pos_photon.y/posvec.y;
+        let dist = Vector3::new(posvec.x * t + pos_photon.x, 0f64, posvec.z * t + pos_photon.z).magnitude();
+
+        if dist > 3f64*RS && dist < 10f64*RS && (((new_pos.y < 0f64) ^ (pos_photon.y < 0f64)) || (new_pos.y == 0f64) || (pos_photon.y == 0f64))
         {
-            return Rgb([255, 200, 0]);
+            let x = ((new_pos.x / RS / 3f64 * *R_ISCO_PX as f64) + (ACCRETION_IMG.width() / 2) as f64) as u32;
+            let y = ((new_pos.z / RS / 3f64 * *R_ISCO_PX as f64) + (ACCRETION_IMG.height() / 2) as f64) as u32;
+            let intensity = (11f64 - (dist/RS)).sqrt() / 2.82842712475;
+            let rgb = ACCRETION_IMG.get_pixel(x, y).to_rgb();
+            return Rgb([(rgb[0] as f64 * intensity) as u8, (rgb[1] as f64 * intensity) as u8, (rgb[2] as f64 * intensity) as u8]);
         }
         pos_photon = new_pos;
     }
