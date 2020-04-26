@@ -1,7 +1,7 @@
 use nalgebra::{Rotation3, Vector3, Unit};
 use image::{RgbImage, Pixel, Rgb};
 use std::time::{Instant};
-use std::cmp::{min};
+use std::cmp::{min, max};
 use num_cpus;
 use std::thread::{spawn, JoinHandle};
 use std::collections::VecDeque;
@@ -22,22 +22,29 @@ const RS: f64 = 2f64 / 3f64 * G * M / C / C; //it's 3 time smaller than it shoul
 
 /*
 TODO:
-    Use better colors (and textures?) for ring and skybox
+    doppler effect?
     user input textures
     user input accretion disc size
+    comments
 */
 
 lazy_static! {
     //textures
-    static ref ACCRETION_IMG: RgbImage = image::open("accretion_disc.png").unwrap().to_rgb();
+    static ref ACCRETION_IMG: RgbImage = image::open("textures/accretion_disc.png").unwrap().to_rgb();
+    static ref SKYBOX_FRONT: RgbImage = image::open("textures/starbox_dimmer/skyboxfront.png").unwrap().to_rgb();
+    static ref SKYBOX_RIGHT: RgbImage = image::open("textures/starbox_dimmer/skyboxright.png").unwrap().to_rgb();
+    static ref SKYBOX_BACK: RgbImage = image::open("textures/starbox_dimmer/skyboxback.png").unwrap().to_rgb();
+    static ref SKYBOX_LEFT: RgbImage = image::open("textures/starbox_dimmer/skyboxleft.png").unwrap().to_rgb();
+    static ref SKYBOX_TOP: RgbImage = image::open("textures/starbox_dimmer/skyboxtop.png").unwrap().to_rgb();
+    static ref SKYBOX_BOTTOM: RgbImage = image::open("textures/starbox_dimmer/skyboxbottom.png").unwrap().to_rgb();
     static ref R_ISCO_PX: u32 = 150u32;
 }
 
 fn main() {
     //Getting input
-    let back: f64 = get_input("Position of the camera on x in multiple of Rs (default: 10): ", "Invalid input. Try again.", 10f64) * RS;
+    let back: f64 = get_input("Position of the camera on x in multiple of Rs (default: 15): ", "Invalid input. Try again.", 15f64) * RS;
     let up: f64 = get_input("Position of the camera on y in multiple of Rs (default: 1): ", "Invalid input. Try again.", 1f64) * RS;
-    let fov_horizontal: f64 = get_input("FOV in degrees (default: 120): ", "Invalid input. Try again.", 120f64) * PI / 180f64;
+    let fov_horizontal: f64 = get_input("FOV in degrees (default: 90): ", "Invalid input. Try again.", 90f64) * PI / 180f64;
     let samples: usize = get_input("Samples per pixel width (default: 1): ", "Invalid input. Try again.", 1usize);
     let mut res = String::new();
     let (img_width, img_height): (u32, u32) = loop {
@@ -172,17 +179,56 @@ fn get_pixel(cam_pos: Vector3<f64>, vertical_angle: f64, horizontal_angle: f64, 
 fn send_ray(mut pos_photon: Vector3<f64>, mut dir_photon: Vector3<f64>) -> Rgb<u8>
 {
     dir_photon = *Unit::new_normalize(dir_photon) * C;
+    let mut color: Rgb<u8> = Rgb([0,0,0]);
+    let mut alpha = 0f64;
+
     let mut delta_time: f64;
     loop
     {
         let dist = pos_photon.magnitude();
         if dist < RS 
         {
-            return Rgb([0,0,0]);
+            let (c, _) = combine_colors(color, alpha, Rgb([0,0,0]), 1f64);
+            return c;
         }
         if dist > RS*20f64
         {
-            return Rgb([0,0,0]);
+            let c = if (dir_photon.x.abs() > dir_photon.y.abs()) && (dir_photon.x.abs() > dir_photon.z.abs())
+            {
+                if dir_photon.x > 0f64
+                {
+                    get_skybox_px(&SKYBOX_RIGHT, dir_photon.x, -dir_photon.z, dir_photon.y)
+                }
+                else
+                {
+                    get_skybox_px(&SKYBOX_LEFT, -dir_photon.x, dir_photon.z, dir_photon.y)
+                }
+            }
+            else if dir_photon.y.abs() > dir_photon.z.abs()
+            {
+                if dir_photon.y > 0f64
+                {
+                    get_skybox_px(&SKYBOX_TOP, dir_photon.y, dir_photon.x, -dir_photon.z)
+                }
+                else
+                {
+                    get_skybox_px(&SKYBOX_BOTTOM, -dir_photon.y, dir_photon.x, dir_photon.z)
+                }
+            }
+            else
+            {
+                if dir_photon.z > 0f64
+                {
+                    get_skybox_px(&SKYBOX_FRONT, dir_photon.z, dir_photon.x, dir_photon.y)
+                }
+                else
+                {
+                    get_skybox_px(&SKYBOX_BACK, -dir_photon.z, -dir_photon.x, dir_photon.y)
+                }
+            };
+
+            let (c, _) = combine_colors(color, alpha, c, 1f64);
+            return c;
         }
 
         if dist < 2f64*RS
@@ -217,9 +263,11 @@ fn send_ray(mut pos_photon: Vector3<f64>, mut dir_photon: Vector3<f64>) -> Rgb<u
         {
             let x = ((new_pos.x / RS / 3f64 * *R_ISCO_PX as f64) + (ACCRETION_IMG.width() / 2) as f64) as u32;
             let y = ((new_pos.z / RS / 3f64 * *R_ISCO_PX as f64) + (ACCRETION_IMG.height() / 2) as f64) as u32;
-            let intensity = (11f64 - (dist/RS)).sqrt() / 2.82842712475;
+            let intensity = (10f64 - (dist/RS)).sqrt() / 2.82842712475;
             let rgb = ACCRETION_IMG.get_pixel(x, y).to_rgb();
-            return Rgb([(rgb[0] as f64 * intensity) as u8, (rgb[1] as f64 * intensity) as u8, (rgb[2] as f64 * intensity) as u8]);
+            let (c, a) = combine_colors(color, alpha, rgb, intensity);
+            color = c;
+            alpha = a;
         }
         pos_photon = new_pos;
     }
@@ -259,4 +307,30 @@ fn get_input<T: FromStr>(message: &str, error_message: &str, default: T) -> T
             }
         }
     };
+}
+
+//alpha is on x, beta is on y
+fn get_skybox_px(texture: &RgbImage, main: f64, hori: f64, vert: f64) -> Rgb<u8> 
+{
+    let sinalpha = hori / (hori * hori + main * main).sqrt();
+    let sinbeta = vert / (vert * vert + main * main).sqrt();
+
+    let width = texture.width() - 1;
+    let height = texture.height() - 1;
+    let x = max(0, min(width, (width as f64 / 2f64 * (1f64 + 1.41421356237 * sinalpha)) as u32));
+    let y = max(0, min(height, (height as f64 / 2f64 * (1f64 + 1.41421356237 * sinbeta)) as u32));
+
+    //println!("{}, {}", x, y);
+
+    return texture.get_pixel(x, y).to_rgb();
+}
+
+fn combine_colors(color1: Rgb<u8>, alpha1: f64, color2: Rgb<u8>, alpha2: f64) -> (Rgb<u8>, f64)
+{
+    let alpha2 = (1f64 - alpha1) * alpha2;
+    let r = color1[0] as f64 + alpha2 * color2[0] as f64;
+    let g = color1[1] as f64 + alpha2 * color2[1] as f64;
+    let b = color1[2] as f64 + alpha2 * color2[2] as f64;
+
+    return (Rgb([r as u8, g as u8, b as u8]), alpha1 + alpha2);
 }
