@@ -3,22 +3,19 @@ use image::{RgbImage, Pixel, Rgb};
 use std::time::{Instant};
 use std::cmp::{min, max};
 use num_cpus;
-use std::thread::{spawn, JoinHandle};
-use std::collections::VecDeque;
+use std::thread::{spawn};
 use std::io::{stdin, stdout, Write};
 use std::str::FromStr;
 use std::f64::consts::PI;
 use lazy_static::lazy_static;
 use chrono::{Local};
+use std::sync::mpsc;
 
-const C: f64 = 299792458.0;
-const M: f64 = 8.3e36;
-const G: f64 = 6.6743e-11;
-const RS: f64 = 2f64 / 3f64 * G * M / C / C; //it's 3 time smaller than it should be
-
-/*
-    Position of the black hole is [0;0;0]
-*/
+const C: f64 = 299792458.0; //speed of light [m/s]
+const M: f64 = 8.3e36; //mass of the black hole [kg]
+const G: f64 = 6.6743e-11; //gravitational constant
+const RS: f64 = 2f64 / 3f64 * G * M / C / C; //it's 3 times smaller than it should be 🤔
+//Position of the black hole is [0;0;0]
 
 /*
 TODO:
@@ -26,6 +23,9 @@ TODO:
     user input textures
     user input accretion disc size
     comments
+
+BUGs:
+    wrong input makes infinite loop?
 */
 
 lazy_static! {
@@ -38,93 +38,102 @@ lazy_static! {
     static ref SKYBOX_TOP: RgbImage = image::open("textures/starbox_dimmer/skyboxtop.png").unwrap().to_rgb();
     static ref SKYBOX_BOTTOM: RgbImage = image::open("textures/starbox_dimmer/skyboxbottom.png").unwrap().to_rgb();
     static ref R_ISCO_PX: u32 = 150u32;
-}
 
-fn main() {
-    //Getting input
-    let back: f64 = get_input("Position of the camera on x in multiple of Rs (default: 15): ", "Invalid input. Try again.", 15f64) * RS;
-    let up: f64 = get_input("Position of the camera on y in multiple of Rs (default: 1): ", "Invalid input. Try again.", 1f64) * RS;
-    let fov_horizontal: f64 = get_input("FOV in degrees (default: 90): ", "Invalid input. Try again.", 90f64) * PI / 180f64;
-    let samples: usize = get_input("Samples per pixel width (default: 1): ", "Invalid input. Try again.", 1usize);
-    let mut res = String::new();
-    let (img_width, img_height): (u32, u32) = loop {
-        print!("Output resolution (default: 512x288): ");
-        stdout().flush().unwrap();
-        match stdin().read_line(&mut res)
-        {
-            Ok(_) => {
-                if res.trim().len() == 0
-                {
-                    break (512, 288);
-                }
-                let parts: Vec<&str> = res.trim().split('x').collect();
-                if parts.len() != 2 {
-                    println!("Invalid input. Try again;");
+    //user input variables
+    static ref BACK: f64 = get_input("Position of the camera on x in multiple of Rs (default: 15): ", "Invalid input. Try again.", 15f64) * RS;
+    static ref UP: f64 = get_input("Position of the camera on y in multiple of Rs (default: 1): ", "Invalid input. Try again.", 1f64) * RS;
+    static ref CAMERA_POSITION: Vector3<f64> = Vector3::new(0f64, *UP, -*BACK);
+    static ref CAMERA_VERTICAL_ANGLE: f64 = (*BACK / CAMERA_POSITION.magnitude()).acos() * UP.signum();
+    
+    static ref FOV_HORIZONTAL: f64 = get_input("FOV in degrees (default: 90): ", "Invalid input. Try again.", 90f64) * PI / 180f64;
+    static ref SAMPLES: usize = get_input("Samples per pixel width (default: 1): ", "Invalid input. Try again.", 1usize);
+
+    static ref IMG_SIZE: (u32, u32) = 
+    {
+        let mut res = String::new();
+        loop {
+            print!("Output resolution (default: 512x288): ");
+            stdout().flush().unwrap();
+            match stdin().read_line(&mut res)
+            {
+                Ok(_) => {
+                    if res.trim().len() == 0
+                    {
+                        break (512, 288);
+                    }
+                    let parts: Vec<&str> = res.trim().split('x').collect();
+                    if parts.len() != 2 {
+                        println!("Invalid input. Try again;");
+                        continue;
+                    }
+                    break ( match parts[0].parse(){
+                        Ok(n) => n,
+                        Err(_) => {
+                            println!("Invalid first number. Try again.");
+                            continue;
+                        }
+                    }, match parts[1].parse(){
+                        Ok(n) => n,
+                        Err(_) => {
+                            println!("Invalid second number. Try again.");
+                            continue;
+                        }
+                    })
+                },
+                Err(_) => {
+                    println!("Error reading input. Try again.");
                     continue;
                 }
-                break ( match parts[0].parse(){
-                    Ok(n) => n,
-                    Err(_) => {
-                        println!("Invalid first number. Try again.");
-                        continue;
-                    }
-                }, match parts[1].parse(){
-                    Ok(n) => n,
-                    Err(_) => {
-                        println!("Invalid second number. Try again.");
-                        continue;
-                    }
-                })
-            },
-            Err(_) => {
-                println!("Error reading input. Try again.");
-                continue;
             }
         }
     };
 
-    //variables
-    let degrees_per_pixel = fov_horizontal / img_width as f64;
-    let fov_vertical = degrees_per_pixel * img_height as f64;
+    static ref DEGREES_PER_PIXEL: f64 = *FOV_HORIZONTAL / IMG_SIZE.0 as f64;
+    static ref FOV_VERTICAL: f64 = *DEGREES_PER_PIXEL * IMG_SIZE.1 as f64;
+}
 
-    let camera_position: Vector3<f64> = Vector3::new(0f64, up, -back);
-    let camera_vertical_angle: f64 = (back / camera_position.magnitude()).acos() * up.signum();
+fn main() {
+    let _ = (*BACK, *UP, *FOV_HORIZONTAL, *SAMPLES, *IMG_SIZE); //Force order of user input prompts
 
-    let mut threads_available = num_cpus::get();
-    let mut img = RgbImage::new(img_width, img_height);
-
-    let mut pixel_thread_queue: VecDeque<JoinHandle<(u32, u32, usize, Rgb<u8>)>> = VecDeque::new();
+    let mut threads_available = num_cpus::get() * 2;
+    let mut img = RgbImage::new(IMG_SIZE.0, IMG_SIZE.1);
 
     //drawing pixels
     let stopwatch = Instant::now();
-    for j in 0..img_height
+
+    let (sender, receiver) = mpsc::channel::<(u32, u32, usize, Rgb<u8>)>();
+    for j in 0..IMG_SIZE.1
     {
-        for i in 0..img_width
+        let rowwatch = Instant::now();
+        for i in 0..IMG_SIZE.0
         {
             if threads_available == 0
             {
-                threads_available += join_pixel_thread(pixel_thread_queue.pop_front().unwrap(), &mut img);
+                let (x, y, free_threads, pixel) = receiver.recv().unwrap();
+                img.put_pixel(x, y, pixel);
+                threads_available += free_threads;
             }
 
-            let threads_to_use = min(threads_available, samples * samples);
+            let threads_to_use = min(threads_available, *SAMPLES * *SAMPLES);
             threads_available -= threads_to_use;
 
-            let pixel_horizontal_angle = degrees_per_pixel * i as f64 - fov_horizontal / 2f64;
-            let pixel_vertical_angle = degrees_per_pixel * j as f64 - fov_vertical / 2f64 + camera_vertical_angle;
-            
-            let (i_clone, j_clone, samples_clone, camera_position_clone, degrees_per_pixel_clone) = (i, j, samples, camera_position, degrees_per_pixel);
+            let pixel_horizontal_angle = *DEGREES_PER_PIXEL * i as f64 - *FOV_HORIZONTAL / 2f64;
+            let pixel_vertical_angle = *DEGREES_PER_PIXEL * j as f64 - *FOV_VERTICAL / 2f64 + *CAMERA_VERTICAL_ANGLE;
 
+            let sender_clone = mpsc::Sender::clone(&sender);
             //pixel thread
-            pixel_thread_queue.push_back( spawn( move || {
-                let pixel = get_pixel(camera_position_clone, pixel_vertical_angle, pixel_horizontal_angle, degrees_per_pixel_clone, samples_clone, threads_to_use);
-                return (i_clone, j_clone, threads_to_use, pixel);
-            }));
+            spawn( move || {
+                let pixel = get_pixel(pixel_vertical_angle, pixel_horizontal_angle, threads_to_use);
+                sender_clone.send((i, j, threads_to_use, pixel)).unwrap();
+            });
         }
-        println!("{}/{}", j+1, img_height);
+        println!("{}/{} in {:?}", j+1, IMG_SIZE.1, rowwatch.elapsed());
     }
-    for h in pixel_thread_queue
+    drop(sender);
+    for message in receiver
     {
-        join_pixel_thread(h, &mut img);
+        let (x, y, _, pixel) = message;
+        img.put_pixel(x, y, pixel);
     }
     println!("Rendered in {:?}", stopwatch.elapsed());
 
@@ -132,39 +141,37 @@ fn main() {
     img.save(format!("output/black_hole_{}.png", time.format("%Y-%m-%d-%H-%M-%S"))).unwrap();
 }
 
-fn get_pixel(cam_pos: Vector3<f64>, vertical_angle: f64, horizontal_angle: f64, degrees_per_pixel: f64, samples: usize, threads_to_use: usize) -> Rgb<u8>
+fn get_pixel(vertical_angle: f64, horizontal_angle: f64, threads_to_use: usize) -> Rgb<u8>
 {
-    let mut ray_thread_queue: VecDeque<JoinHandle<Rgb<u8>>> = VecDeque::new();
     let mut colors: Vec<Rgb<u8>> = Vec::new();
     let mut ray_threads_available = threads_to_use;
-    for p_j in 0..samples
+    let (sender, receiver) = mpsc::channel::<Rgb<u8>>();
+
+    for p_j in 0..*SAMPLES
     {
-        for p_i in 0..samples
+        for p_i in 0..*SAMPLES
         {
             if ray_threads_available == 0
             {
-                colors.push(ray_thread_queue.pop_front().unwrap().join().unwrap());
+                colors.push(receiver.recv().unwrap());
                 ray_threads_available += 1;
             }
-
-            let ray_horizontal_angle = degrees_per_pixel * (p_i as f64 + 0.5) / samples as f64 - degrees_per_pixel / 2f64 + horizontal_angle;
-            let ray_vertical_angle = degrees_per_pixel * (p_j as f64 + 0.5) / samples as f64 - degrees_per_pixel / 2f64 + vertical_angle;
-
-            let ray_dir: Vector3<f64> = Vector3::new(ray_vertical_angle.cos() * ray_horizontal_angle.sin(), -ray_vertical_angle.sin(), ray_vertical_angle.cos()*ray_horizontal_angle.cos());
-            let camera_position_clone = cam_pos;
-
             //ray thread
-            ray_thread_queue.push_back( spawn( move || {
-                return send_ray(camera_position_clone, ray_dir);
-            }));
+            let sender_clone = mpsc::Sender::clone(&sender);
+            spawn( move || {
+                let color = send_ray(horizontal_angle, vertical_angle, p_i, p_j);
+                sender_clone.send(color).unwrap();
+            });
             ray_threads_available -= 1;
         }
     }
-    for t in ray_thread_queue
+    drop(sender);
+    for message in receiver
     {
-        colors.push(t.join().unwrap());
+        colors.push(message);
     }
 
+    //averaging colors
     let (mut r, mut g, mut b): (u32, u32, u32) = (0,0,0);
     let color_count = colors.len() as u32;
     for c in colors
@@ -176,9 +183,15 @@ fn get_pixel(cam_pos: Vector3<f64>, vertical_angle: f64, horizontal_angle: f64, 
     return Rgb([(r / color_count) as u8, (g / color_count) as u8, (b / color_count) as u8]);
 }
 
-fn send_ray(mut pos_photon: Vector3<f64>, mut dir_photon: Vector3<f64>) -> Rgb<u8>
+fn send_ray(horizontal_angle: f64, vertical_angle: f64, i: usize, j: usize) -> Rgb<u8>
 {
+    let ray_horizontal_angle = *DEGREES_PER_PIXEL * (i as f64 + 0.5) / *SAMPLES as f64 - *DEGREES_PER_PIXEL / 2f64 + horizontal_angle;
+    let ray_vertical_angle = *DEGREES_PER_PIXEL * (j as f64 + 0.5) / *SAMPLES as f64 - *DEGREES_PER_PIXEL / 2f64 + vertical_angle;
+
+    let mut dir_photon: Vector3<f64> = Vector3::new(ray_vertical_angle.cos() * ray_horizontal_angle.sin(), -ray_vertical_angle.sin(), ray_vertical_angle.cos() * ray_horizontal_angle.cos());
     dir_photon = *Unit::new_normalize(dir_photon) * C;
+    let mut pos_photon = *CAMERA_POSITION;
+    
     let mut color: Rgb<u8> = Rgb([0,0,0]);
     let mut alpha = 0f64;
 
@@ -273,12 +286,14 @@ fn send_ray(mut pos_photon: Vector3<f64>, mut dir_photon: Vector3<f64>) -> Rgb<u
     }
 }
 
+/*
 fn join_pixel_thread(handle: JoinHandle<(u32, u32, usize, Rgb<u8>)>, img: &mut RgbImage) -> usize
 {
     let (x, y, threads, rgb) = handle.join().unwrap();
     img.put_pixel(x, y, rgb);
     return threads;
 }
+*/
 
 fn get_input<T: FromStr>(message: &str, error_message: &str, default: T) -> T
 {
